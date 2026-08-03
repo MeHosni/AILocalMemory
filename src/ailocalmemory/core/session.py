@@ -1,6 +1,7 @@
 from typing import List, Dict, Optional
 from .storage import BaseStorage, InMemoryStorage, SQLiteStorage
 from .optimizer import BaseOptimizer, TokenLimitOptimizer
+from .vector import VectorDatabase
 
 class ChatSession:
     """
@@ -13,9 +14,15 @@ class ChatSession:
         session_id: str, 
         storage: str = "memory",
         storage_kwargs: Optional[Dict] = None,
-        optimizer: Optional[BaseOptimizer] = None
+        optimizer: Optional[BaseOptimizer] = None,
+        enable_rag: bool = True
     ):
         self.session_id = session_id
+        
+        # Setup Vector Storage (Long-Term Memory)
+        self.enable_rag = enable_rag
+        if self.enable_rag:
+            self.vector_db = VectorDatabase()
         
         # Setup storage
         storage_kwargs = storage_kwargs or {}
@@ -34,6 +41,9 @@ class ChatSession:
     def add_message(self, role: str, content: str) -> None:
         """Adds a message to the session."""
         self.storage.save_message(self.session_id, role, content)
+        
+        if self.enable_rag and role in ["user", "assistant"]:
+            self.vector_db.upsert_memory(self.session_id, role, content)
         
     def add_user_message(self, content: str) -> None:
         """Helper to add a user message."""
@@ -59,6 +69,20 @@ class ChatSession:
         Returns the optimized (truncated) history ready to be sent to the LLM.
         """
         messages = self.get_full_history()
+        
+        if self.enable_rag and messages:
+            # Find the last user message to use as the semantic query
+            last_user_msg = next((msg["content"] for msg in reversed(messages) if msg["role"] == "user"), None)
+            if last_user_msg:
+                memories = self.vector_db.recall_memories(self.session_id, last_user_msg, n_results=3)
+                if memories:
+                    memory_text = "\n".join([f"- {m}" for m in memories])
+                    rag_prompt = f"\n\n[LONG-TERM MEMORY RECALL]\nHere are relevant past memories from this user:\n{memory_text}\nUse this context to inform your response if relevant."
+                    
+                    # Inject into the system message (which is always preserved by the optimizer)
+                    if messages[0].get("role") == "system":
+                        messages[0]["content"] += rag_prompt
+                        
         return self.optimizer.optimize(messages)
         
     def clear(self) -> None:

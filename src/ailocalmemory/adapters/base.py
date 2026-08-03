@@ -12,19 +12,21 @@ class BaseAdapter(ABC):
         self.memory = memory_session
         
     @abstractmethod
-    def send(self, message: str, stream: bool = False, **kwargs) -> Union[str, Generator[str, None, None]]:
+    def send(self, message: str, stream: bool = False, save_history: bool = True, **kwargs) -> Union[str, Generator[str, None, None]]:
         """
         Sends a message to the AI.
         If stream=False, returns the full string response.
         If stream=True, returns a generator that yields string chunks, and saves to memory at the end.
+        If save_history=False, the message and response will not be logged in the database.
         """
         pass
         
     @abstractmethod
-    async def send_async(self, message: str, stream: bool = False, **kwargs) -> Union[str, AsyncGenerator[str, None]]:
+    async def send_async(self, message: str, stream: bool = False, save_history: bool = True, **kwargs) -> Union[str, AsyncGenerator[str, None]]:
         """
         Asynchronous version of send().
         If stream=False, returns the full string response.
         If stream=True, returns an async generator yielding string chunks.
+        If save_history=False, the message and response will not be logged in the database.
         """
         pass

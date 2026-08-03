@@ -20,9 +20,33 @@ class OllamaAdapter(BaseAdapter):
         self.model = model
         self.base_url = base_url.rstrip("/")
         
-    def _prepare_request(self, message: str, stream: bool, **kwargs):
-        self.memory.add_user_message(message)
-        messages = self.memory.get_context()
+    def _prepare_request(self, message: str, stream: bool, save_history: bool = True, bypass_memory: bool = False, **kwargs):
+        history_message = kwargs.pop("history_message", message)
+        is_system_trigger = kwargs.pop("is_system_trigger", False)
+        
+        if save_history and not is_system_trigger:
+            self.memory.add_user_message(history_message)
+            
+        if bypass_memory:
+            messages = [{"role": "user", "content": message}]
+        else:
+            messages = self.memory.get_context()
+            if save_history and not is_system_trigger:
+                # Replace the content of the last user message in the context (which was just added)
+                # with the augmented RAG message so the LLM sees the search results.
+                if messages and messages[-1]["role"] == "user":
+                    messages[-1]["content"] = message
+            else:
+                messages.append({"role": "user", "content": message})
+            
+        # Parse multimodal <IMAGE:...> tags from messages without breaking SQLite
+        import re
+        for msg in messages:
+            images = re.findall(r'<IMAGE:(.*?)>', msg.get("content", ""))
+            if images:
+                msg["images"] = images
+                msg["content"] = re.sub(r'<IMAGE:.*?>', '', msg["content"])
+                
         url = f"{self.base_url}/api/chat"
         payload = {
             "model": self.model,
@@ -32,17 +56,18 @@ class OllamaAdapter(BaseAdapter):
         }
         return url, payload
         
-    def send(self, message: str, stream: bool = False, **kwargs) -> Union[str, Generator[str, None, None]]:
-        url, payload = self._prepare_request(message, stream, **kwargs)
+    def send(self, message: str, stream: bool = False, save_history: bool = True, **kwargs) -> Union[str, Generator[str, None, None]]:
+        is_system_trigger = kwargs.get("is_system_trigger", False)
+        url, payload = self._prepare_request(message, stream, save_history=save_history, **kwargs)
         
         try:
             if not stream:
                 with httpx.Client() as client:
-                    response = client.post(url, json=payload, timeout=60.0)
+                    response = client.post(url, json=payload, timeout=300.0)
                     response.raise_for_status()
                     data = response.json()
                     assistant_content = data.get("message", {}).get("content", "")
-                    if assistant_content:
+                    if assistant_content and save_history and not is_system_trigger:
                         self.memory.add_assistant_message(assistant_content)
                     return assistant_content
             else:
@@ -50,7 +75,7 @@ class OllamaAdapter(BaseAdapter):
                     full_content = []
                     try:
                         with httpx.Client() as client:
-                            with client.stream("POST", url, json=payload, timeout=60.0) as response:
+                            with client.stream("POST", url, json=payload, timeout=300.0) as response:
                                 response.raise_for_status()
                                 for line in response.iter_lines():
                                     if line:
@@ -63,7 +88,7 @@ class OllamaAdapter(BaseAdapter):
                                         except json.JSONDecodeError:
                                             continue
                     finally:
-                        if full_content:
+                        if full_content and save_history and not is_system_trigger:
                             self.memory.add_assistant_message("".join(full_content))
                 
                 return response_generator()
@@ -75,17 +100,18 @@ class OllamaAdapter(BaseAdapter):
                 return error_gen()
             return error_msg
             
-    async def send_async(self, message: str, stream: bool = False, **kwargs) -> Union[str, AsyncGenerator[str, None]]:
-        url, payload = await asyncio.to_thread(self._prepare_request, message, stream, **kwargs)
+    async def send_async(self, message: str, stream: bool = False, save_history: bool = True, **kwargs) -> Union[str, AsyncGenerator[str, None]]:
+        is_system_trigger = kwargs.get("is_system_trigger", False)
+        url, payload = await asyncio.to_thread(self._prepare_request, message, stream, save_history=save_history, **kwargs)
         
         try:
             if not stream:
                 async with httpx.AsyncClient() as client:
-                    response = await client.post(url, json=payload, timeout=60.0)
+                    response = await client.post(url, json=payload, timeout=300.0)
                     response.raise_for_status()
                     data = response.json()
                     assistant_content = data.get("message", {}).get("content", "")
-                    if assistant_content:
+                    if assistant_content and save_history and not is_system_trigger:
                         await asyncio.to_thread(self.memory.add_assistant_message, assistant_content)
                     return assistant_content
             else:
@@ -93,7 +119,7 @@ class OllamaAdapter(BaseAdapter):
                     full_content = []
                     try:
                         async with httpx.AsyncClient() as client:
-                            async with client.stream("POST", url, json=payload, timeout=60.0) as response:
+                            async with client.stream("POST", url, json=payload, timeout=300.0) as response:
                                 response.raise_for_status()
                                 async for line in response.aiter_lines():
                                     if line:
@@ -105,8 +131,10 @@ class OllamaAdapter(BaseAdapter):
                                                 yield content
                                         except json.JSONDecodeError:
                                             continue
+                    except httpx.RequestError as e:
+                        yield f"Failed to connect to Ollama at {self.base_url}: {str(e)}"
                     finally:
-                        if full_content:
+                        if full_content and save_history and not is_system_trigger:
                             await asyncio.to_thread(self.memory.add_assistant_message, "".join(full_content))
                         
                 return response_generator()
